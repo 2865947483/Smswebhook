@@ -1,31 +1,136 @@
-name: Build Debug APK
+name: Weekly Build
+
 on:
+  schedule:
+    - cron: '0 15 * * 0' #每周天国际标准时间15点，北京时间23:00
   workflow_dispatch:
+    inputs:
+      root_sol:
+        description: "Weekly Build Title"
+        required: true
+        default: "SmsForwarder"
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      output: "${{ github.workspace }}/build/app/outputs/apk/release"
     steps:
-      - name: Checkout code
+      - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
 
-      - name: Setup JDK 11
-        uses: actions/setup-java@v5
+      - name: 检查最近7天是否有提交，无提交直接退出
+        run: |
+          if [ -z "$(git log --since='7 days ago' --oneline)" ]; then
+            echo "no recent commits"
+            exit 0
+          fi
+
+      - name: Delete Weekly Build
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.TOKEN }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 0
+          delete_workflow_pattern: 'Weekly Build'
+
+      - name: set up JDK 11
+        uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
           java-version: '11'
           java-package: jdk
 
-      - name: Cache Gradle packages
-        uses: actions/cache@v4
+      - name: Checkout Android Keystore
+        uses: actions/checkout@v4
         with:
-          path: ~/.gradle/caches
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          repository: pppscn/keystore
+          token: ${{ secrets.TOKEN }}
+          path: keystore
 
-      - name: Build Debug APK
-        run: bash ./gradlew clean assembleDebug
+      - name: Build with Gradle
+        run: bash ./gradlew assembleRelease
 
-      - name: Upload APK Artifact
+      - name: Parse output-metadata.json and upload APKs to XUpdate
+        run: |
+          metadata_file="${{ env.output }}/output-metadata.json"
+          applicationId=$(jq -r '.applicationId' "${metadata_file}")
+          buildDate=$(jq -r '.buildDate' "${metadata_file}")
+          buildTime=$(jq -r '.buildTime' "${metadata_file}")
+          gitCommitId=$(jq -r '.gitCommitId' "${metadata_file}")
+
+          jq -r '.elements | sort_by(.outputFile) | .[].outputFile' "${metadata_file}" | while IFS= read -r apk; do
+            echo "APK: $apk"
+            if [[ $apk =~ SmsF_([^_]+)_([^_]+)_(.+)_release.apk ]]; then
+              versionName="${BASH_REMATCH[1]}"
+              versionCode="${BASH_REMATCH[2]}"
+              abi="${BASH_REMATCH[3]}"
+              echo "ver_name=$versionName" >> $GITHUB_ENV
+              echo "ver_code=${versionCode: -3}" >> $GITHUB_ENV
+
+              response=$(curl --retry 3 -X POST \
+                -H "Cache-Control: no-cache" \
+                -H "Content-Type: application/json" \
+                -H "Cookie: xupdate_token=${{ secrets.XUPDATE_TOKEN }}" \
+                -H "X-Token: ${{ secrets.X_TOKEN }}" \
+                -d "{\"appKey\":\"${applicationId}\",\"versionName\":\"${versionName}\",\"versionCode\":\"${versionCode}\",\"modifyContent\":\"\",\"updateStatus\":1,\"gitCommitId\":\"${gitCommitId}\",\"buildTime\":\"${buildTime}\",\"uploadTime\":\"${buildTime}\"}" \
+                ${{ secrets.URL_ADD_VERSION }})
+
+              version_id=$(echo $response | grep -oP '"versionId":\s*\K\d+')
+              echo "versionId: $version_id"
+
+              if [[ $version_id =~ ^[0-9]+$ ]]; then
+                curl --retry 3 -X POST \
+                  -H "Cache-Control: no-cache" \
+                  -H "Content-Type: multipart/form-data" \
+                  -H "Cookie: ${{ secrets.XUPDATE_TOKEN }}" \
+                  -H "X-Token: ${{ secrets.X_TOKEN }}" \
+                  -F "file=@${{ env.output }}/${apk};filename=${apk}" \
+                  -F "versionId=${version_id}" \
+                  ${{ secrets.URL_UPLOAD_APK }}
+                if [[ $? -eq 0 ]]; then
+                  success=true
+                fi
+              else
+                echo "Error: version_id is not a valid number. skip upload apk"
+              fi
+            fi
+          done
+
+      - name: Upload App To Artifact universal
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
-          name: SmsForwarder-Debug-APK
-          path: app/build/outputs/apk/debug/
+          name: "SmsF_${{ env.ver_name }}_100${{ env.ver_code }}universal_release.apk"
+          path: "${{ env.output }}/SmsF*_universal_release.apk"
+
+      - name: Upload App To Artifact armeabi-v7a
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "SmsF_${{ env.ver_name }}_200${{ env.ver_code }}armeabi-v7a_release.apk"
+          path: "${{ env.output }}/SmsF*_armeabi-v7a_release.apk"
+
+      - name: Upload App To Artifact arm64-v8a
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "SmsF_${{ env.ver_name }}_300${{ env.ver_code }}arm64-v8a_release.apk"
+          path: "${{ env.output }}/SmsF*_arm64-v8a_release.apk"
+
+      - name: Upload App To Artifact x86
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "SmsF_${{ env.ver_name }}_400${{ env.ver_code }}x86_release.apk"
+          path: "${{ env.output }}/SmsF*_x86_release.apk"
+
+      - name: Upload App To Artifact x86_64
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "SmsF_${{ env.ver_name }}_500${{ env.ver_code }}x86_64_release.apk"
+          path: "${{ env.output }}/SmsF*_x86_64_release.apk"
